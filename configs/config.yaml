@@ -1,5 +1,5 @@
 # ============================================================
-# Drywall QA — SAM3 + DoRA Fine-tune Config
+# Drywall QA — SAM ViT-H + DoRA config
 # ============================================================
 
 seed: 42
@@ -11,42 +11,11 @@ data:
   val_split: 0.20
   image_size: 768
 
-# ── Prompt engine ────────────────────────────────────────────
-prompts:
-  crack:
-    - "segment crack"
-    - "wall fracture"
-    - "hairline crack"
-    - "surface crack"
-    - "drywall defect"
-  taping:
-    - "segment taping area"
-    - "drywall seam"
-    - "joint line"
-    - "wall joint tape"
-    - "connection seam"
-    - "thin seam"
-    - "faint wall joint"
-    - "vertical seam line"
-
-prompt_engine:
-  dropout_prob: 0.10
-  noise_prob: 0.15
-
-# Weighted ensemble at inference
-inference_prompts:
-  crack:
-    prompts: ["segment crack", "wall fracture", "surface crack", "hairline crack", "drywall defect"]
-    weights: [0.30, 0.25, 0.20, 0.15, 0.10]
-  taping:
-    prompts: ["segment taping area", "drywall seam", "thin seam", "faint wall joint", "vertical seam line"]
-    weights: [0.25, 0.25, 0.20, 0.15, 0.15]
-
 # ── Model ────────────────────────────────────────────────────
 model:
-  name: "facebook/sam3"
+  name: "facebook/sam-vit-huge"
   precision: "bfloat16"
-  torch_compile: true   # enabled for L40S
+  torch_compile: false
 
 # ── DoRA ─────────────────────────────────────────────────────
 dora:
@@ -54,9 +23,6 @@ dora:
   lora_alpha: 32
   lora_dropout: 0.05
   use_dora: true
-  target_modules:
-    - "q_proj"
-    - "v_proj"
 
 # ── Training ─────────────────────────────────────────────────
 training:
@@ -68,7 +34,7 @@ training:
       image_size: 512
       freeze_encoder: true
 
-    - name: "Phase 2 — Mixed (crack + taping)"
+    - name: "Phase 2 — Mixed + HEM"
       epochs: 5
       lr: 1.0e-4
       classes: ["crack", "taping"]
@@ -76,7 +42,7 @@ training:
       freeze_encoder: true
       hem_start_epoch: 2
 
-    - name: "Phase 3 — Crack-heavy + unfreeze"
+    - name: "Phase 3 — Precision + unfreeze"
       epochs: 8
       lr: 5.0e-5
       classes: ["crack", "taping"]
@@ -84,15 +50,13 @@ training:
       freeze_encoder: false
       hem_start_epoch: 0
 
-  # 🔥 L40S tuned
-  batch_size: 8
-  grad_accumulation: 2
-
+  batch_size: 4
+  grad_accumulation: 4
   mask_threshold: 0.5
   top_k_masks: 3
   optimizer: "adamw"
   weight_decay: 1.0e-4
-  num_workers: 8
+  num_workers: 4
 
 # ── Loss ─────────────────────────────────────────────────────
 loss:
@@ -107,14 +71,10 @@ loss:
 # ── Augmentation ─────────────────────────────────────────────
 augmentation:
   crack:
-    sharpen_alpha: [0.4, 0.9]
-    sharpen_lightness: [0.5, 1.2]
     patch_prob: 0.25
     patch_scale: [0.15, 0.40]
     synthetic_crack_prob: 0.20
   taping:
-    sharpen_alpha: [0.1, 0.3]
-    sharpen_lightness: [0.7, 1.0]
     patch_prob: 0.70
     patch_scale: [0.20, 0.50]
     synthetic_crack_prob: 0.0
@@ -126,7 +86,7 @@ hem:
   boost_factor: 3.0
   update_every_n_epochs: 1
 
-# ── Class weights ─────────────────────────────────────────────
+# ── Sampling weights ─────────────────────────────────────────
 class_weights:
   crack: 1.0
   taping: 5.4
