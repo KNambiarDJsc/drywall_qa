@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.append(str(Path(__file__).parents[1]))
-from training.losses import HybridLoss
+from drywall_training.losses import HybridLoss
 from dataset.hard_example_mining import HardExampleMiner
 from utils.metrics import MetricAccumulator, dice_score
 from utils.common import get_logger, ensure_dir

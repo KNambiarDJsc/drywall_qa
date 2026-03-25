@@ -9,7 +9,7 @@ sys.path.append(str(Path(__file__).parent))
 from utils.common import set_seed, get_logger, get_device
 from dataset.drywall_dataset import build_dataloaders
 from models.grounded_sam2 import GroundedSAM2
-from training.trainer import DrywallTrainer
+from drywall_training.trainer import DrywallTrainer
 from utils.visualize import plot_training_curves
 
 logger = get_logger("train")
