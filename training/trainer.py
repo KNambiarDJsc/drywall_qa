@@ -1,20 +1,16 @@
-"""training/trainer.py — Curriculum trainer for SAM ViT-H + DoRA.
-Uses point prompts (not text). All other logic unchanged.
-"""
+"""training/trainer.py — Grounded SAM 2 curriculum trainer."""
 
 from __future__ import annotations
-import json
-import time
+import json, time
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -28,57 +24,34 @@ from utils.common import get_logger, ensure_dir
 logger = get_logger("trainer")
 
 
-# ─────────────────────────────────────────────────────────────
-# Multi-mask supervision
-# ─────────────────────────────────────────────────────────────
-
-def topk_mask_loss(pred_all, target, criterion, k=3):
-    """Min loss across K mask proposals."""
-    B, K_actual, H, W = pred_all.shape
-    k = min(k, K_actual)
-    losses = []
-    for i in range(k):
-        l, _ = criterion(pred_all[:, i:i+1], target)
-        losses.append(l.unsqueeze(0))
-    stacked  = torch.cat(losses)
-    loss     = stacked.min()
-    best_idx = stacked.argmin().item()
-    best_pred = pred_all[:, best_idx:best_idx+1]
-    _, breakdown = criterion(best_pred, target)
-    return loss, breakdown, best_pred
-
-
-# ─────────────────────────────────────────────────────────────
-# Encoder freeze helpers
-# ─────────────────────────────────────────────────────────────
-
 def _set_encoder_frozen(model, frozen):
-    base = model.sam.base_model if hasattr(model.sam, "base_model") else model.sam
-    encoder = getattr(base, "vision_encoder", None) or getattr(base, "image_encoder", None)
-    if encoder:
-        for p in encoder.parameters():
-            p.requires_grad_(not frozen)
-    for name, p in model.sam.named_parameters():
+    """Freeze/unfreeze SAM 2 image encoder."""
+    sam_base = model.sam2.sam.base_model if hasattr(model.sam2.sam, "base_model") else model.sam2.sam
+    for attr in ["image_encoder", "vision_encoder"]:
+        enc = getattr(sam_base, attr, None)
+        if enc:
+            for p in enc.parameters():
+                p.requires_grad_(not frozen)
+            break
+    # Always keep DoRA
+    for name, p in model.sam2.sam.named_parameters():
         if "lora_" in name or "dora_" in name:
             p.requires_grad_(True)
     logger.info(f"  Encoder: {'FROZEN' if frozen else 'UNFROZEN'}")
 
 
-def _unfreeze_last_encoder_layers(model, n_layers=4):
-    base = model.sam.base_model if hasattr(model.sam, "base_model") else model.sam
-    encoder = getattr(base, "vision_encoder", None) or getattr(base, "image_encoder", None)
-    if not encoder:
-        return
-    blocks = getattr(encoder, "layers", None) or getattr(encoder, "blocks", [])
-    for block in list(blocks)[-n_layers:]:
-        for p in block.parameters():
-            p.requires_grad_(True)
-    logger.info(f"  Unfroze last {n_layers} encoder blocks")
+def _unfreeze_last_blocks(model, n=4):
+    sam_base = model.sam2.sam.base_model if hasattr(model.sam2.sam, "base_model") else model.sam2.sam
+    for attr in ["image_encoder", "vision_encoder"]:
+        enc = getattr(sam_base, attr, None)
+        if enc:
+            blocks = getattr(enc, "blocks", getattr(enc, "layers", []))
+            for blk in list(blocks)[-n:]:
+                for p in blk.parameters():
+                    p.requires_grad_(True)
+            logger.info(f"  Unfroze last {n} encoder blocks")
+            break
 
-
-# ─────────────────────────────────────────────────────────────
-# Trainer
-# ─────────────────────────────────────────────────────────────
 
 class DrywallTrainer:
     def __init__(self, model, train_loader, val_loader, train_dataset, cfg,
@@ -101,8 +74,8 @@ class DrywallTrainer:
             tversky_beta=loss_cfg.get("tversky_beta", 0.30),
         )
 
-        self.top_k  = cfg["training"].get("top_k_masks", 3)
-        self.scaler = GradScaler(enabled=(model.dtype == torch.float16))
+        use_fp16 = (model.dtype == torch.float16)
+        self.scaler = GradScaler("cuda", enabled=use_fp16)
 
         hem_cfg = cfg.get("hem", {})
         self.hem_enabled = hem_cfg.get("enabled", True)
@@ -113,10 +86,6 @@ class DrywallTrainer:
             boost_factor=hem_cfg.get("boost_factor", 3.0),
         ) if self.hem_enabled else None
 
-        if cfg["model"].get("torch_compile", False):
-            self.model.sam = torch.compile(self.model.sam)
-            logger.info("torch.compile() enabled")
-
         self.history = {
             "train_loss": [],
             "val_dice_crack": [], "val_dice_taping": [], "val_dice_macro": [],
@@ -125,36 +94,28 @@ class DrywallTrainer:
         }
         self.best_score = 0.0
 
-    # ── Phase 0 ───────────────────────────────────────────────
-
     def run_baseline(self):
-        logger.info("─" * 55)
-        logger.info("Phase 0 — Zero-shot baseline")
-        metrics = self._eval_epoch()
-        logger.info(
-            f"Baseline  Dice crack={metrics['crack']['dice']:.4f}  "
-            f"taping={metrics['taping']['dice']:.4f}"
-        )
-        return metrics
-
-    # ── Main training loop ────────────────────────────────────
+        logger.info("─" * 55 + "\nPhase 0 — Zero-shot baseline")
+        m = self._eval_epoch()
+        logger.info(f"Baseline  crack={m['crack']['dice']:.4f}  taping={m['taping']['dice']:.4f}")
+        return m
 
     def train(self):
-        for phase_cfg in self.cfg["training"]["curriculum"]:
-            name       = phase_cfg["name"]
-            epochs     = phase_cfg["epochs"]
-            lr         = phase_cfg["lr"]
-            classes    = phase_cfg.get("classes", ["crack", "taping"])
-            img_size   = phase_cfg.get("image_size", self.cfg["data"]["image_size"])
-            freeze_enc = phase_cfg.get("freeze_encoder", True)
-            hem_start  = phase_cfg.get("hem_start_epoch", 999)
+        for phase in self.cfg["training"]["curriculum"]:
+            name       = phase["name"]
+            epochs     = phase["epochs"]
+            lr         = phase["lr"]
+            classes    = phase.get("classes", ["crack", "taping"])
+            img_size   = phase.get("image_size", self.cfg["data"]["image_size"])
+            freeze_enc = phase.get("freeze_encoder", True)
+            hem_start  = phase.get("hem_start_epoch", 999)
 
             logger.info(f"\n{'═'*55}\n{name}")
             self.train_ds.reload_with_classes(classes)
             self.train_ds.set_image_size(img_size)
             _set_encoder_frozen(self.model, freeze_enc)
             if not freeze_enc:
-                _unfreeze_last_encoder_layers(self.model, n_layers=4)
+                _unfreeze_last_blocks(self.model)
 
             cw = self.cfg.get("class_weights", {"crack": 1.0, "taping": 5.4})
             self._rebuild_loader(classes, cw)
@@ -167,8 +128,7 @@ class DrywallTrainer:
 
             for epoch in range(1, epochs + 1):
                 t0 = time.time()
-
-                if self.hem_enabled and epoch > hem_start:
+                if self.hem_enabled and epoch > hem_start and self.hem:
                     self._rebuild_loader_hem(cw)
 
                 hem_ids, hem_scores = [], []
@@ -176,38 +136,32 @@ class DrywallTrainer:
                 val_metrics = self._eval_epoch()
                 scheduler.step()
 
-                if self.hem_enabled and hem_ids:
+                if self.hem_enabled and hem_ids and self.hem:
                     self.hem.update(hem_ids, hem_scores)
 
                 macro_dice = val_metrics["macro"]["dice"]
-                self._log(epoch, train_loss, val_metrics,
-                          scheduler.get_last_lr()[0], time.time()-t0)
+                self._log(epoch, train_loss, val_metrics, scheduler.get_last_lr()[0], time.time()-t0)
 
                 if macro_dice > self.best_score:
                     self.best_score = macro_dice
                     self._save("best")
-                    logger.info(f"  ★ New best  Dice={macro_dice:.4f}")
+                    logger.info(f"  ★ New best Dice={macro_dice:.4f}")
 
         self._save("final")
         self._save_history()
         logger.info(f"\n✅ Done. Best macro Dice={self.best_score:.4f}")
 
-    # ── DataLoader rebuild helpers ────────────────────────────
-
     def _rebuild_loader(self, classes, cw):
-        from dataset.drywall_dataset import MinClassBatchSampler
+        from dataset.drywall_dataset import MinClassBatchSampler, pil_collate_fn
         from torch.utils.data import WeightedRandomSampler
-
         bs = self.cfg["training"]["batch_size"]
         nw = self.cfg["training"]["num_workers"]
 
-        if "taping" in classes:
-            sampler = MinClassBatchSampler(
-                self.train_ds, bs, cw, minority_class="taping", min_per_batch=1
-            )
+        if "taping" in classes and "crack" in classes:
+            sampler = MinClassBatchSampler(self.train_ds, bs, cw)
             self.train_loader = DataLoader(
                 self.train_ds, batch_sampler=sampler,
-                num_workers=nw, pin_memory=True,
+                num_workers=nw, pin_memory=True, collate_fn=pil_collate_fn,
             )
         else:
             weights = torch.tensor(
@@ -218,41 +172,42 @@ class DrywallTrainer:
             self.train_loader = DataLoader(
                 self.train_ds, batch_size=bs, sampler=sampler,
                 num_workers=nw, pin_memory=True, drop_last=True,
+                collate_fn=pil_collate_fn,
             )
 
     def _rebuild_loader_hem(self, cw):
+        from dataset.drywall_dataset import pil_collate_fn
         sampler = self.hem.get_sampler()
         bs = self.cfg["training"]["batch_size"]
         nw = self.cfg["training"]["num_workers"]
         self.train_loader = DataLoader(
             self.train_ds, batch_size=bs, sampler=sampler,
             num_workers=nw, pin_memory=True, drop_last=True,
+            collate_fn=pil_collate_fn,
         )
-
-    # ── Train epoch ───────────────────────────────────────────
 
     def _train_epoch(self, optimizer, hem_ids, hem_scores):
         self.model.train()
+        self.model.dino.eval()   # DINO always frozen
         total_loss = 0.0
         grad_acc   = self.cfg["training"]["grad_accumulation"]
         threshold  = self.cfg["training"].get("mask_threshold", 0.5)
+        use_fp16   = (self.model.dtype == torch.float16)
         optimizer.zero_grad()
 
         pbar = tqdm(self.train_loader, desc="  train", leave=False)
         for step, batch in enumerate(pbar):
-            images       = batch["image"].to(self.model.device, dtype=self.model.dtype)
-            masks        = batch["mask"].to(self.model.device)
-            input_points = batch["input_points"].to(self.model.device)
-            input_labels = batch["input_labels"].to(self.model.device)
+            images     = batch["image"].to(self.model.device, dtype=self.model.dtype)
+            masks      = batch["mask"].to(self.model.device)
+            images_pil = batch["image_pil"]
+            prompts    = batch["prompt"]
 
-            with autocast(enabled=(self.model.dtype == torch.float16)):
-                pred_all = self.model.forward_all_masks(
-                    images, input_points, input_labels,
+            with autocast("cuda", enabled=use_fp16):
+                pred = self.model(
+                    images, images_pil, prompts,
                     target_size=tuple(masks.shape[-2:]),
                 )
-                loss, breakdown, best_pred = topk_mask_loss(
-                    pred_all, masks, self.criterion, k=self.top_k
-                )
+                loss, breakdown = self.criterion(pred, masks)
                 loss = loss / grad_acc
 
             self.scaler.scale(loss).backward()
@@ -266,7 +221,7 @@ class DrywallTrainer:
 
             with torch.no_grad():
                 for i, img_id in enumerate(batch["image_id"]):
-                    d = dice_score(best_pred[i:i+1], masks[i:i+1], threshold).item()
+                    d = dice_score(pred[i:i+1], masks[i:i+1], threshold).item()
                     hem_ids.append(img_id)
                     hem_scores.append(d)
 
@@ -275,24 +230,23 @@ class DrywallTrainer:
 
         return total_loss / max(len(self.train_loader), 1)
 
-    # ── Eval epoch ────────────────────────────────────────────
-
     def _eval_epoch(self):
         self.model.eval()
         acc       = MetricAccumulator(["crack", "taping"])
         threshold = self.cfg["training"].get("mask_threshold", 0.5)
+        use_fp16  = (self.model.dtype == torch.float16)
 
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="  val  ", leave=False):
-                images       = batch["image"].to(self.model.device, dtype=self.model.dtype)
-                masks        = batch["mask"].to(self.model.device)
-                input_points = batch["input_points"].to(self.model.device)
-                input_labels = batch["input_labels"].to(self.model.device)
-                labels       = batch["label"]
+                images     = batch["image"].to(self.model.device, dtype=self.model.dtype)
+                masks      = batch["mask"].to(self.model.device)
+                images_pil = batch["image_pil"]
+                prompts    = batch["prompt"]
+                labels     = batch["label"]
 
-                with autocast(enabled=(self.model.dtype == torch.float16)):
+                with autocast("cuda", enabled=use_fp16):
                     pred = self.model(
-                        images, input_points, input_labels,
+                        images, images_pil, prompts,
                         target_size=tuple(masks.shape[-2:]),
                     )
 
@@ -300,8 +254,6 @@ class DrywallTrainer:
                     acc.update(pred[i:i+1], masks[i:i+1], label, threshold)
 
         return acc.compute()
-
-    # ── Logging / checkpointing ───────────────────────────────
 
     def _log(self, epoch, train_loss, val_metrics, lr, elapsed):
         self.history["train_loss"].append(train_loss)
