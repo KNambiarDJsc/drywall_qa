@@ -13,7 +13,7 @@ WeightedRandomSampler / MinClassBatchSampler unchanged.
 from __future__ import annotations
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -32,35 +32,19 @@ logger = get_logger("dataset")
 
 
 # ─────────────────────────────────────────────────────────────
-# Point prompt generation (replaces text prompts)
+# Point prompt — exact implementation required by SAM
 # ─────────────────────────────────────────────────────────────
 
-def get_point_prompt(
-    mask: np.ndarray,       # H×W uint8 {0,1}
-    mode: str = "random",   # "random" | "centroid"
-) -> Tuple[List[int], int]:
-    """
-    Returns ([x, y], label=1) derived from GT mask.
-    Falls back to image centre if mask is empty.
-    """
-    h, w  = mask.shape
-    fg    = np.argwhere(mask > 0)   # (N, 2) → (row, col)
+def generate_points_from_mask(mask):
+    ys, xs = np.where(mask > 0)
 
-    if len(fg) == 0:
-        return [w // 2, h // 2], 1
+    if len(xs) == 0:
+        return np.array([[[0, 0]]], dtype=np.float32), np.array([[0]], dtype=np.int64)
 
-    if mode == "centroid":
-        row = int(fg[:, 0].mean())
-        col = int(fg[:, 1].mean())
-        # Clamp to foreground if centroid lands in background
-        if mask[row, col] == 0:
-            idx = np.random.randint(len(fg))
-            row, col = int(fg[idx][0]), int(fg[idx][1])
-    else:
-        idx = np.random.randint(len(fg))
-        row, col = int(fg[idx][0]), int(fg[idx][1])
+    idx = np.random.randint(0, len(xs))
+    x, y = xs[idx], ys[idx]
 
-    return [col, row], 1   # SAM expects (x=col, y=row)
+    return np.array([[[x, y]]], dtype=np.float32), np.array([[1]], dtype=np.int64)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -229,19 +213,14 @@ class DrywallDataset(Dataset):
         mask_tensor  = t["mask"].unsqueeze(0).float()
 
         # ── Point prompt from GT mask ──────────────────────────
-        mask_np  = mask_tensor.squeeze().numpy()
-        mode     = "random" if self.augment else "centroid"
-        pt, lbl  = get_point_prompt(mask_np, mode=mode)
-
-        # SAM expects [batch, num_obj, num_points, 2]
-        input_points = torch.tensor([[pt]], dtype=torch.float32)    # [1, 1, 2]
-        input_labels = torch.tensor([[lbl]], dtype=torch.long)       # [1, 1]
+        mask_np = mask_tensor.squeeze().numpy()
+        points, labels = generate_points_from_mask(mask_np)
 
         return {
             "image":        image_tensor,
             "mask":         mask_tensor,
-            "input_points": input_points,
-            "input_labels": input_labels,
+            "input_points": torch.tensor(points),
+            "input_labels": torch.tensor(labels),
             "label":        label,
             "image_id":     Path(row["image_path"]).stem,
             "orig_h":       orig_h,
