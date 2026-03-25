@@ -2,10 +2,6 @@
 # Drywall QA — SAM3 + DoRA Fine-tune Config
 # ============================================================
 
-# ============================================================
-# Drywall QA — SAM3 + DoRA  ·  Full Power Config
-# ============================================================
-
 seed: 42
 
 data:
@@ -13,7 +9,7 @@ data:
   taping_root: "data/drywall_taping"
   processed_root: "dataset"
   val_split: 0.20
-  image_size: 768           # base resolution
+  image_size: 768
 
 # ── Prompt engine ────────────────────────────────────────────
 prompts:
@@ -34,10 +30,10 @@ prompts:
     - "vertical seam line"
 
 prompt_engine:
-  dropout_prob: 0.10        # prob of passing empty string prompt
-  noise_prob: 0.15          # prob of random char-swap in prompt
+  dropout_prob: 0.10
+  noise_prob: 0.15
 
-# Weighted ensemble at inference (sum must be 1.0 per class)
+# Weighted ensemble at inference
 inference_prompts:
   crack:
     prompts: ["segment crack", "wall fracture", "surface crack", "hairline crack", "drywall defect"]
@@ -50,7 +46,7 @@ inference_prompts:
 model:
   name: "facebook/sam3"
   precision: "bfloat16"
-  torch_compile: false      # set true on A100/H100 for ~20% speedup
+  torch_compile: true   # enabled for L40S
 
 # ── DoRA ─────────────────────────────────────────────────────
 dora:
@@ -64,12 +60,11 @@ dora:
 
 # ── Training ─────────────────────────────────────────────────
 training:
-  # Curriculum phases — order matters
   curriculum:
     - name: "Phase 1 — Taping Only (easy shapes)"
       epochs: 3
       lr: 1.0e-4
-      classes: ["taping"]           # only taping batches
+      classes: ["taping"]
       image_size: 512
       freeze_encoder: true
 
@@ -79,23 +74,25 @@ training:
       classes: ["crack", "taping"]
       image_size: 768
       freeze_encoder: true
-      hem_start_epoch: 2            # start Hard Example Mining at epoch 2
+      hem_start_epoch: 2
 
     - name: "Phase 3 — Crack-heavy + unfreeze"
       epochs: 8
       lr: 5.0e-5
       classes: ["crack", "taping"]
       image_size: 768
-      freeze_encoder: false         # unfreeze last encoder layers
+      freeze_encoder: false
       hem_start_epoch: 0
 
-  batch_size: 4                     # 8 for L40S
-  grad_accumulation: 4
+  # 🔥 L40S tuned
+  batch_size: 8
+  grad_accumulation: 2
+
   mask_threshold: 0.5
-  top_k_masks: 3                    # multi-mask supervision: use best of K masks
+  top_k_masks: 3
   optimizer: "adamw"
   weight_decay: 1.0e-4
-  num_workers: 4
+  num_workers: 8
 
 # ── Loss ─────────────────────────────────────────────────────
 loss:
@@ -107,38 +104,38 @@ loss:
   focal_alpha: 0.50
   focal_gamma: 2.0
 
-# ── Augmentation (class-aware) ────────────────────────────────
+# ── Augmentation ─────────────────────────────────────────────
 augmentation:
   crack:
     sharpen_alpha: [0.4, 0.9]
     sharpen_lightness: [0.5, 1.2]
-    patch_prob: 0.25              # crack visible at full res — patch is a boost
+    patch_prob: 0.25
     patch_scale: [0.15, 0.40]
     synthetic_crack_prob: 0.20
   taping:
     sharpen_alpha: [0.1, 0.3]
     sharpen_lightness: [0.7, 1.0]
-    patch_prob: 0.70              # seam is ~0.5% of pixels — patch is mandatory
+    patch_prob: 0.70
     patch_scale: [0.20, 0.50]
     synthetic_crack_prob: 0.0
 
 # ── Hard Example Mining ───────────────────────────────────────
 hem:
   enabled: true
-  dice_threshold: 0.45              # samples below this are "hard"
-  boost_factor: 3.0                 # multiply sampling weight by this
+  dice_threshold: 0.45
+  boost_factor: 3.0
   update_every_n_epochs: 1
 
-# ── WeightedRandomSampler base weights ───────────────────────
+# ── Class weights ─────────────────────────────────────────────
 class_weights:
   crack: 1.0
   taping: 5.4
 
 # ── Inference ────────────────────────────────────────────────
 inference:
-  tta_enabled: true                 # Test-Time Augmentation (h-flip)
-  multiscale: [768, 1024]           # multi-scale inference
-  morph_close_crack: true           # cv2.morphologyEx CLOSE on crack masks
+  tta_enabled: true
+  multiscale: [768, 1024]
+  morph_close_crack: true
   morph_kernel_size: 3
 
 # ── Output ───────────────────────────────────────────────────
