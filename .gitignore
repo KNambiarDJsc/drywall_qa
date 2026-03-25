@@ -110,3 +110,8 @@ torch_compile_debug/
 # ================================
 *.swp
 *.swo
+
+data/
+dataset/
+*.csv
+*.json
