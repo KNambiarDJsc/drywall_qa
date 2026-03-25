@@ -103,7 +103,6 @@ torch_compile_debug/
 *.swp
 *.swo
 
-dataset/
 data/
 *.zip
 *.tar
