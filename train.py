@@ -1,32 +1,21 @@
-"""train.py — Main training entry point (SAM ViT-H + DoRA).
-Usage:
-  python train.py --config configs/config.yaml
-"""
+"""train.py — Grounded SAM 2 + DoRA training entry point."""
 
 from __future__ import annotations
-import argparse
-import os
-import sys
-import json
+import argparse, os, sys, json
 from pathlib import Path
-
 import yaml
 
 sys.path.append(str(Path(__file__).parent))
-from utils.common import set_seed, get_logger
+from utils.common import set_seed, get_logger, get_device
 from dataset.drywall_dataset import build_dataloaders
-from models.sam_dora import SAMDoRA
+from models.grounded_sam2 import GroundedSAM2
 from training.trainer import DrywallTrainer
 from utils.visualize import plot_training_curves
 
 logger = get_logger("train")
 
 
-# ─────────────────────────────────────────────────────────────
-# HuggingFace login
-# ─────────────────────────────────────────────────────────────
-
-def hf_login() -> None:
+def hf_login():
     token = os.environ.get("HF_TOKEN")
     if token:
         try:
@@ -34,14 +23,9 @@ def hf_login() -> None:
             login(token=token, add_to_git_credential=False)
             logger.info("✅ HuggingFace login successful")
         except Exception as e:
-            logger.warning(f"HF login failed: {e} — trying anonymous")
+            logger.warning(f"HF login failed: {e}")
     else:
         logger.warning("HF_TOKEN not set — attempting anonymous download")
-
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
 
 
 def main():
@@ -51,14 +35,16 @@ def main():
     parser.add_argument("--skip_baseline", action="store_true")
     args = parser.parse_args()
 
-    # HF login before any from_pretrained()
     hf_login()
 
-    cfg = load_config(args.config)
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
     set_seed(cfg["seed"])
 
     logger.info("=" * 60)
-    logger.info("Drywall QA — SAM ViT-H + DoRA")
+    logger.info("Drywall QA — Grounded SAM 2 + DoRA")
+    logger.info(f"DINO: {cfg['model']['grounding_dino']} (frozen)")
+    logger.info(f"SAM2: {cfg['model']['sam2']} (DoRA fine-tuned)")
     logger.info(f"Seed: {cfg['seed']} | Batch: {cfg['training']['batch_size']}")
     logger.info("=" * 60)
 
@@ -74,14 +60,7 @@ def main():
     )
 
     # ── Model ─────────────────────────────────────────────────
-    model = SAMDoRA(
-        model_name=cfg["model"]["name"],
-        precision=cfg["model"]["precision"],
-        lora_r=cfg["dora"]["r"],
-        lora_alpha=cfg["dora"]["lora_alpha"],
-        lora_dropout=cfg["dora"]["lora_dropout"],
-        use_dora=cfg["dora"]["use_dora"],
-    )
+    model = GroundedSAM2(cfg=cfg, device=get_device())
 
     # ── Trainer ───────────────────────────────────────────────
     trainer = DrywallTrainer(
@@ -93,7 +72,6 @@ def main():
         checkpoint_dir=cfg["output"]["checkpoint_dir"],
     )
 
-    # Phase 0 — baseline
     if not args.skip_baseline:
         baseline = trainer.run_baseline()
         ckpt_dir = Path(cfg["output"]["checkpoint_dir"])
@@ -101,15 +79,13 @@ def main():
         with open(ckpt_dir / "baseline_metrics.json", "w") as f:
             json.dump(baseline, f, indent=2)
 
-    # Phases 1–3 — fine-tune
     trainer.train()
 
-    # Plot training curves
     plot_training_curves(
         trainer.history,
         save_path=Path(cfg["output"]["viz_dir"]) / "training_curves.png",
     )
-    logger.info("Done. ✅")
+    logger.info("Done ✅")
 
 
 if __name__ == "__main__":
