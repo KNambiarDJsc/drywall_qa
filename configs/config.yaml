@@ -32,7 +32,7 @@ model:
   grounding_dino: "IDEA-Research/grounding-dino-tiny"
   sam2: "facebook/sam2-hiera-large"
   precision: "bfloat16"   # ✅ FIXED
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   torch_compile: false
 
 # ── DoRA ─────────────────────────────────────────────────────
