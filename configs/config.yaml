@@ -14,7 +14,7 @@ data:
 # ── Model ────────────────────────────────────────────────────
 model:
   name: "facebook/sam-vit-huge"
-  precision: "bfloat16"
+  precision: "fp16"          # RTX 4090 — fp16 faster than bfloat16 on Ada Lovelace
   torch_compile: false
 
 # ── DoRA ─────────────────────────────────────────────────────
@@ -50,13 +50,13 @@ training:
       freeze_encoder: false
       hem_start_epoch: 0
 
-  batch_size: 4
-  grad_accumulation: 4
+  batch_size: 4              # RTX 4090 24GB — SAM ViT-H at 768px fits bs=4
+  grad_accumulation: 2       # effective batch = 8
   mask_threshold: 0.5
   top_k_masks: 3
   optimizer: "adamw"
   weight_decay: 1.0e-4
-  num_workers: 4
+  num_workers: 8             # RTX 4090 workstation — 8 workers saturates the GPU
 
 # ── Loss ─────────────────────────────────────────────────────
 loss:
