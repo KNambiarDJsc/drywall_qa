@@ -145,7 +145,7 @@ class DrywallTrainer:
             self.model.sam3 = torch.compile(self.model.sam3)
 
         self.history: Dict[str, list] = {
-            "train_loss": [], "val_loss": [],
+            "train_loss": [],
             "val_dice_crack": [], "val_dice_taping": [], "val_dice_macro": [],
             "val_miou_crack": [], "val_miou_taping": [], "val_miou_macro": [],
             "lr": [],
