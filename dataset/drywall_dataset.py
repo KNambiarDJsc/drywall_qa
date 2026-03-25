@@ -175,8 +175,8 @@ class DrywallDataset(Dataset):
         prompt_map=None,
         prompt_dropout_prob=0.10,
         prompt_noise_prob=0.15,
-        patch_prob_crack=0.50,
-        patch_prob_taping=0.50,   # was 0.20 — seams are tiny, patch is mandatory
+        patch_prob_crack=0.25,    # crack visible at full res — patch is a boost, not mandatory
+        patch_prob_taping=0.70,   # seam is ~0.5% of pixels at full res — patch is mandatory
         patch_scale_crack=(0.15, 0.40),
         patch_scale_taping=(0.30, 0.60),
         synthetic_crack_prob=0.20,
