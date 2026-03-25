@@ -1,0 +1,149 @@
+# ============================================================
+# Drywall QA — SAM3 + DoRA Fine-tune Config
+# ============================================================
+
+# ============================================================
+# Drywall QA — SAM3 + DoRA  ·  Full Power Config
+# ============================================================
+
+seed: 42
+
+data:
+  crack_root: "data/cracks"
+  taping_root: "data/drywall_taping"
+  processed_root: "dataset"
+  val_split: 0.20
+  image_size: 768           # base resolution
+
+# ── Prompt engine ────────────────────────────────────────────
+prompts:
+  crack:
+    - "segment crack"
+    - "wall fracture"
+    - "hairline crack"
+    - "surface crack"
+    - "drywall defect"
+  taping:
+    - "segment taping area"
+    - "drywall seam"
+    - "joint line"
+    - "wall joint tape"
+    - "connection seam"
+    - "thin seam"
+    - "faint wall joint"
+    - "vertical seam line"
+
+prompt_engine:
+  dropout_prob: 0.10        # prob of passing empty string prompt
+  noise_prob: 0.15          # prob of random char-swap in prompt
+
+# Weighted ensemble at inference (sum must be 1.0 per class)
+inference_prompts:
+  crack:
+    prompts: ["segment crack", "wall fracture", "surface crack", "hairline crack", "drywall defect"]
+    weights: [0.30, 0.25, 0.20, 0.15, 0.10]
+  taping:
+    prompts: ["segment taping area", "drywall seam", "thin seam", "faint wall joint", "vertical seam line"]
+    weights: [0.25, 0.25, 0.20, 0.15, 0.15]
+
+# ── Model ────────────────────────────────────────────────────
+model:
+  name: "facebook/sam3"
+  precision: "bfloat16"
+  torch_compile: true      # set true on A100/H100 for ~20% speedup
+
+# ── DoRA ─────────────────────────────────────────────────────
+dora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  use_dora: true
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+
+# ── Training ─────────────────────────────────────────────────
+training:
+  # Curriculum phases — order matters
+  curriculum:
+    - name: "Phase 1 — Taping Only (easy shapes)"
+      epochs: 3
+      lr: 1.0e-4
+      classes: ["taping"]           # only taping batches
+      image_size: 512
+      freeze_encoder: true
+
+    - name: "Phase 2 — Mixed (crack + taping)"
+      epochs: 5
+      lr: 1.0e-4
+      classes: ["crack", "taping"]
+      image_size: 768
+      freeze_encoder: true
+      hem_start_epoch: 2            # start Hard Example Mining at epoch 2
+
+    - name: "Phase 3 — Crack-heavy + unfreeze"
+      epochs: 8
+      lr: 5.0e-5
+      classes: ["crack", "taping"]
+      image_size: 768
+      freeze_encoder: false         # unfreeze last encoder layers
+      hem_start_epoch: 0
+
+  batch_size: 4                     # 8 for L40S
+  grad_accumulation: 4
+  mask_threshold: 0.5
+  top_k_masks: 3                    # multi-mask supervision: use best of K masks
+  optimizer: "adamw"
+  weight_decay: 1.0e-4
+  num_workers: 4
+
+# ── Loss ─────────────────────────────────────────────────────
+loss:
+  focal_weight: 0.40
+  tversky_weight: 0.50
+  boundary_weight: 0.10
+  tversky_alpha: 0.7
+  tversky_beta: 0.3
+  focal_alpha: 0.50
+  focal_gamma: 2.0
+
+# ── Augmentation (class-aware) ────────────────────────────────
+augmentation:
+  crack:
+    sharpen_alpha: [0.4, 0.9]       # stronger for cracks
+    sharpen_lightness: [0.5, 1.2]
+    patch_prob: 0.50                # prob of patch-crop around mask region
+    patch_scale: [0.15, 0.40]       # crop size as fraction of image
+    synthetic_crack_prob: 0.20      # inject fake cracks
+  taping:
+    sharpen_alpha: [0.1, 0.4]
+    sharpen_lightness: [0.7, 1.0]
+    patch_prob: 0.20
+    patch_scale: [0.30, 0.60]
+    synthetic_crack_prob: 0.0
+
+# ── Hard Example Mining ───────────────────────────────────────
+hem:
+  enabled: true
+  dice_threshold: 0.45              # samples below this are "hard"
+  boost_factor: 3.0                 # multiply sampling weight by this
+  update_every_n_epochs: 1
+
+# ── WeightedRandomSampler base weights ───────────────────────
+class_weights:
+  crack: 1.0
+  taping: 5.4
+
+# ── Inference ────────────────────────────────────────────────
+inference:
+  tta_enabled: true                 # Test-Time Augmentation (h-flip)
+  multiscale: [768, 1024]           # multi-scale inference
+  morph_close_crack: true           # cv2.morphologyEx CLOSE on crack masks
+  morph_kernel_size: 3
+
+# ── Output ───────────────────────────────────────────────────
+output:
+  checkpoint_dir: "checkpoints"
+  mask_dir: "outputs/masks"
+  viz_dir: "outputs/visualizations"
+  best_metric: "dice"
