@@ -50,7 +50,7 @@ inference_prompts:
 model:
   name: "facebook/sam3"
   precision: "bfloat16"
-  torch_compile: true      # set true on A100/H100 for ~20% speedup
+  torch_compile: false      # set true on A100/H100 for ~20% speedup
 
 # ── DoRA ─────────────────────────────────────────────────────
 dora:
@@ -110,16 +110,16 @@ loss:
 # ── Augmentation (class-aware) ────────────────────────────────
 augmentation:
   crack:
-    sharpen_alpha: [0.4, 0.9]       # stronger for cracks
+    sharpen_alpha: [0.4, 0.9]
     sharpen_lightness: [0.5, 1.2]
-    patch_prob: 0.50                # prob of patch-crop around mask region
-    patch_scale: [0.15, 0.40]       # crop size as fraction of image
-    synthetic_crack_prob: 0.20      # inject fake cracks
+    patch_prob: 0.25              # crack visible at full res — patch is a boost
+    patch_scale: [0.15, 0.40]
+    synthetic_crack_prob: 0.20
   taping:
-    sharpen_alpha: [0.1, 0.4]
+    sharpen_alpha: [0.1, 0.3]
     sharpen_lightness: [0.7, 1.0]
-    patch_prob: 0.20
-    patch_scale: [0.30, 0.60]
+    patch_prob: 0.70              # seam is ~0.5% of pixels — patch is mandatory
+    patch_scale: [0.20, 0.50]
     synthetic_crack_prob: 0.0
 
 # ── Hard Example Mining ───────────────────────────────────────
