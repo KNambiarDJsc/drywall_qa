@@ -1,0 +1,112 @@
+# ================================
+# 🔹 Python
+# ================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.env/
+.env.*
+.venv/
+ENV/
+
+# ================================
+# 🔹 Jupyter / IPython
+# ================================
+.ipynb_checkpoints/
+
+# ================================
+# 🔹 Logs & temp files
+# ================================
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# ================================
+# 🔹 OS files
+# ================================
+.DS_Store
+Thumbs.db
+
+# ================================
+# 🔹 IDE / Editor
+# ================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ================================
+# 🔹 PyTorch / Model artifacts
+# ================================
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# ================================
+# 🔹 Dataset & generated data
+# ================================
+data/
+dataset/
+*.csv
+*.json
+
+# (optional: keep metadata if needed)
+!dataset/metadata.csv
+
+# ================================
+# 🔹 Images & outputs
+# ================================
+*.png
+*.jpg
+*.jpeg
+*.tif
+
+# BUT allow small sample visuals if needed
+!outputs/visualizations/
+
+# ================================
+# 🔹 Cache / build
+# ================================
+.cache/
+*.cache
+build/
+dist/
+*.egg-info/
+
+# ================================
+# 🔹 HuggingFace / Transformers
+# ================================
+.huggingface/
+transformers_cache/
+hf_cache/
+
+# ================================
+# 🔹 CUDA / Torch compile cache
+# ================================
+*.nvfuser_cache/
+torch_compile_debug/
+
+# ================================
+# 🔹 Misc
+# ================================
+.env.local
+.env.production
+.env.development
+
+# ================================
+# 🔹 System specific
+# ================================
+*.swp
+*.swo
