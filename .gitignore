@@ -112,6 +112,5 @@ torch_compile_debug/
 *.swo
 
 data/
-dataset/
 *.csv
 *.json
