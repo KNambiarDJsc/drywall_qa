@@ -1,18 +1,17 @@
 """dataset/drywall_dataset.py
-Phase 3 – PyTorch Dataset
-Phase 4 – Class-aware augmentation pipeline (CLAHE, crack-specific sharpen,
-           patch-based crop, synthetic cracks)
-Phase 5 – WeightedRandomSampler (base) + Hard Example Mining hook
+Dataset for SAM ViT-H — uses POINT prompts derived from GT mask centroids.
+No text prompts (SAM original does not support text).
 
-Prompt engine:
-  • Dropout  — blank prompt with prob p (forces visual grounding)
-  • Noise    — random char-swap typos (robustness)
-  • Weighted ensemble available at inference (see predict.py)
+Point prompt strategy:
+  Training  : random point sampled from GT mask foreground pixels
+  Validation: centroid of GT mask (deterministic)
+
+Class-aware augmentation, patch crop, synthetic cracks, HEM all unchanged.
+WeightedRandomSampler / MinClassBatchSampler unchanged.
 """
 
 from __future__ import annotations
 import random
-import string
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -31,48 +30,37 @@ from utils.common import get_logger
 
 logger = get_logger("dataset")
 
-PROMPT_MAP: Dict[str, List[str]] = {
-    "crack":  ["segment crack","wall fracture","hairline crack","surface crack","drywall defect"],
-    "taping": [
-        "segment taping area",
-        "drywall seam",
-        "joint line",
-        "wall joint tape",
-        "connection seam",
-        "thin seam",               # new — targets faint seams
-        "faint wall joint",        # new — low-contrast cases
-        "vertical seam line",      # new — signals orientation to SAM3
-    ],
-}
-
 
 # ─────────────────────────────────────────────────────────────
-# Prompt engine
+# Point prompt generation (replaces text prompts)
 # ─────────────────────────────────────────────────────────────
 
-def _inject_typo(text: str, n_swaps: int = 1) -> str:
-    chars = list(text)
-    for _ in range(n_swaps):
-        if len(chars) < 4:
-            break
-        idx = random.randint(1, len(chars) - 2)
-        mode = random.choice(["swap", "drop", "replace"])
-        if mode == "swap" and idx + 1 < len(chars):
-            chars[idx], chars[idx + 1] = chars[idx + 1], chars[idx]
-        elif mode == "drop":
-            chars.pop(idx)
-        else:
-            chars[idx] = random.choice(string.ascii_lowercase)
-    return "".join(chars)
+def get_point_prompt(
+    mask: np.ndarray,       # H×W uint8 {0,1}
+    mode: str = "random",   # "random" | "centroid"
+) -> Tuple[List[int], int]:
+    """
+    Returns ([x, y], label=1) derived from GT mask.
+    Falls back to image centre if mask is empty.
+    """
+    h, w  = mask.shape
+    fg    = np.argwhere(mask > 0)   # (N, 2) → (row, col)
 
+    if len(fg) == 0:
+        return [w // 2, h // 2], 1
 
-def sample_prompt(label, prompt_map, dropout_prob=0.10, noise_prob=0.15):
-    if random.random() < dropout_prob:
-        return ""
-    prompt = random.choice(prompt_map[label])
-    if random.random() < noise_prob:
-        prompt = _inject_typo(prompt)
-    return prompt
+    if mode == "centroid":
+        row = int(fg[:, 0].mean())
+        col = int(fg[:, 1].mean())
+        # Clamp to foreground if centroid lands in background
+        if mask[row, col] == 0:
+            idx = np.random.randint(len(fg))
+            row, col = int(fg[idx][0]), int(fg[idx][1])
+    else:
+        idx = np.random.randint(len(fg))
+        row, col = int(fg[idx][0]), int(fg[idx][1])
+
+    return [col, row], 1   # SAM expects (x=col, y=row)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -81,17 +69,17 @@ def sample_prompt(label, prompt_map, dropout_prob=0.10, noise_prob=0.15):
 
 def patch_crop_around_mask(image, mask, target_size, scale_range=(0.15, 0.40)):
     h, w = image.shape[:2]
-    fg = np.argwhere(mask > 0)
+    fg   = np.argwhere(mask > 0)
     if len(fg) == 0:
         cy, cx = h // 2, w // 2
-        half = min(h, w) // 2
+        half   = min(h, w) // 2
         y1, y2, x1, x2 = cy-half, cy+half, cx-half, cx+half
     else:
         y_min, x_min = fg.min(axis=0)
         y_max, x_max = fg.max(axis=0)
-        scale = random.uniform(*scale_range)
-        pad_y = max(int((y_max - y_min) * scale), 10)
-        pad_x = max(int((x_max - x_min) * scale), 10)
+        scale  = random.uniform(*scale_range)
+        pad_y  = max(int((y_max - y_min) * scale), 10)
+        pad_x  = max(int((x_max - x_min) * scale), 10)
         y1 = max(0, y_min - pad_y)
         y2 = min(h, y_max + pad_y)
         x1 = max(0, x_min - pad_x)
@@ -101,12 +89,13 @@ def patch_crop_around_mask(image, mask, target_size, scale_range=(0.15, 0.40)):
     if crop_img.size == 0:
         return image, mask
     crop_img = cv2.resize(crop_img, (target_size, target_size))
-    crop_msk = cv2.resize(crop_msk, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
+    crop_msk = cv2.resize(crop_msk, (target_size, target_size),
+                          interpolation=cv2.INTER_NEAREST)
     return crop_img, crop_msk
 
 
 # ─────────────────────────────────────────────────────────────
-# Class-aware augmentation pipelines
+# Class-aware augmentation
 # ─────────────────────────────────────────────────────────────
 
 def _common_pixel():
@@ -127,7 +116,7 @@ def build_crack_transforms(image_size=768):
         *_common_pixel(),
         A.Sharpen(alpha=(0.4, 0.9), lightness=(0.5, 1.2), p=0.80),
         A.UnsharpMask(blur_limit=(3, 7), sigma_limit=0.0, alpha=(0.3, 0.7), p=0.50),
-        A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ], additional_targets={"mask": "mask"})
 
@@ -137,17 +126,15 @@ def build_taping_transforms(image_size=768):
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.Rotate(limit=15, p=0.4, border_mode=cv2.BORDER_REFLECT_101),
-        A.RandomResizedCrop(height=image_size, width=image_size, scale=(0.7,1.0), ratio=(0.9,1.1), p=0.4),
+        A.RandomResizedCrop(height=image_size, width=image_size,
+                            scale=(0.7, 1.0), ratio=(0.9, 1.1), p=0.4),
         A.Resize(image_size, image_size),
-        # ── Taping-specific: lower clip_limit to preserve seam texture ──
-        # clip_limit=(2,4) instead of 4.0 fixed — high clip crushes the
-        # faint contrast gradient that distinguishes seam from wall
         A.CLAHE(clip_limit=(2, 4), tile_grid_size=(8, 8), p=1.0),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.6, p=0.8),
         A.GaussNoise(var_limit=(10.0, 60.0), p=0.3),
         A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02, p=0.3),
         A.Sharpen(alpha=(0.1, 0.3), lightness=(0.7, 1.0), p=0.50),
-        A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ], additional_targets={"mask": "mask"})
 
@@ -156,7 +143,7 @@ def build_val_transforms(image_size=768):
     return A.Compose([
         A.Resize(image_size, image_size),
         A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=1.0),
-        A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ], additional_targets={"mask": "mask"})
 
@@ -166,17 +153,25 @@ def build_val_transforms(image_size=768):
 # ─────────────────────────────────────────────────────────────
 
 class DrywallDataset(Dataset):
+    """
+    Returns dict:
+        image         : [3, H, W] float32 normalised
+        mask          : [1, H, W] float32 {0,1}
+        input_points  : [1, 1, 2] float32  (x, y)
+        input_labels  : [1, 1]    long     (1 = positive)
+        label         : str  "crack" | "taping"
+        image_id      : str
+        orig_h/orig_w : int
+    """
+
     def __init__(
         self,
         metadata_csv,
         split="train",
         image_size=768,
         augment=True,
-        prompt_map=None,
-        prompt_dropout_prob=0.10,
-        prompt_noise_prob=0.15,
-        patch_prob_crack=0.25,    # crack visible at full res — patch is a boost, not mandatory
-        patch_prob_taping=0.70,   # seam is ~0.5% of pixels at full res — patch is mandatory
+        patch_prob_crack=0.25,
+        patch_prob_taping=0.70,
         patch_scale_crack=(0.15, 0.40),
         patch_scale_taping=(0.30, 0.60),
         synthetic_crack_prob=0.20,
@@ -189,20 +184,19 @@ class DrywallDataset(Dataset):
             df = df[df["type"].isin(active_classes)]
         self.df = df.reset_index(drop=True)
 
-        self.split = split
+        self.split     = split
         self.image_size = image_size
-        self.augment = augment
-        self.prompt_map = prompt_map or PROMPT_MAP
-        self.prompt_dropout_prob = prompt_dropout_prob
-        self.prompt_noise_prob = prompt_noise_prob
-        self.patch_prob = {"crack": patch_prob_crack, "taping": patch_prob_taping}
+        self.augment   = augment
+        self.patch_prob  = {"crack": patch_prob_crack, "taping": patch_prob_taping}
         self.patch_scale = {"crack": patch_scale_crack, "taping": patch_scale_taping}
         self.synthetic_crack_prob = synthetic_crack_prob
         self._syn_aug = SyntheticCrackAugmentation()
 
         self._transforms = {
-            "crack":  build_crack_transforms(image_size) if augment else build_val_transforms(image_size),
-            "taping": build_taping_transforms(image_size) if augment else build_val_transforms(image_size),
+            "crack":  build_crack_transforms(image_size) if augment
+                      else build_val_transforms(image_size),
+            "taping": build_taping_transforms(image_size) if augment
+                      else build_val_transforms(image_size),
         }
 
         logger.info(
@@ -215,10 +209,10 @@ class DrywallDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+        row   = self.df.iloc[idx]
         label = row["type"]
 
-        img = cv2.cvtColor(cv2.imread(str(row["image_path"])), cv2.COLOR_BGR2RGB)
+        img  = cv2.cvtColor(cv2.imread(str(row["image_path"])), cv2.COLOR_BGR2RGB)
         orig_h, orig_w = img.shape[:2]
         mask = (cv2.imread(str(row["mask_path"]), cv2.IMREAD_GRAYSCALE) > 127).astype(np.uint8)
 
@@ -230,40 +224,44 @@ class DrywallDataset(Dataset):
                     img, mask, self.image_size, self.patch_scale[label]
                 )
 
-        t = self._transforms[label](image=img, mask=mask)
+        t            = self._transforms[label](image=img, mask=mask)
         image_tensor = t["image"]
         mask_tensor  = t["mask"].unsqueeze(0).float()
 
-        prompt = sample_prompt(
-            label, self.prompt_map,
-            self.prompt_dropout_prob if self.augment else 0.0,
-            self.prompt_noise_prob   if self.augment else 0.0,
-        )
+        # ── Point prompt from GT mask ──────────────────────────
+        mask_np  = mask_tensor.squeeze().numpy()
+        mode     = "random" if self.augment else "centroid"
+        pt, lbl  = get_point_prompt(mask_np, mode=mode)
+
+        # SAM expects [batch, num_obj, num_points, 2]
+        input_points = torch.tensor([[pt]], dtype=torch.float32)    # [1, 1, 2]
+        input_labels = torch.tensor([[lbl]], dtype=torch.long)       # [1, 1]
 
         return {
-            "image":    image_tensor,
-            "mask":     mask_tensor,
-            "prompt":   prompt,
-            "label":    label,
-            "image_id": Path(row["image_path"]).stem,
-            "orig_h":   orig_h,
-            "orig_w":   orig_w,
+            "image":        image_tensor,
+            "mask":         mask_tensor,
+            "input_points": input_points,
+            "input_labels": input_labels,
+            "label":        label,
+            "image_id":     Path(row["image_path"]).stem,
+            "orig_h":       orig_h,
+            "orig_w":       orig_w,
         }
 
-    def reload_with_classes(self, classes: List[str]) -> None:
-        """Curriculum hot-swap — no DataLoader rebuild needed."""
+    def reload_with_classes(self, classes):
         df = pd.read_csv(self._src_csv)
         self.df = df[
             (df["split"] == self.split) & (df["type"].isin(classes))
         ].reset_index(drop=True)
         logger.info(f"[Curriculum] classes={classes}  n={len(self.df)}")
 
-    def set_image_size(self, size: int) -> None:
-        """Resolution curriculum — rebuild transforms in place."""
+    def set_image_size(self, size):
         self.image_size = size
         self._transforms = {
-            "crack":  build_crack_transforms(size) if self.augment else build_val_transforms(size),
-            "taping": build_taping_transforms(size) if self.augment else build_val_transforms(size),
+            "crack":  build_crack_transforms(size) if self.augment
+                      else build_val_transforms(size),
+            "taping": build_taping_transforms(size) if self.augment
+                      else build_val_transforms(size),
         }
         logger.info(f"[Curriculum] image_size → {size}")
 
@@ -273,32 +271,17 @@ class DrywallDataset(Dataset):
 # ─────────────────────────────────────────────────────────────
 
 class MinClassBatchSampler(torch.utils.data.Sampler):
-    """
-    Guarantees at least `min_per_batch` samples of `minority_class`
-    in every batch. The rest are filled with WeightedRandomSampler draws.
+    """Guarantees ≥1 taping sample per batch."""
 
-    Prevents the edge case where a batch has zero taping samples and the
-    mask decoder sees only cracks for an entire update step — which causes
-    taping Dice to silently degrade mid-training.
-    """
-
-    def __init__(
-        self,
-        dataset: DrywallDataset,
-        batch_size: int,
-        class_weights: Dict[str, float],
-        minority_class: str = "taping",
-        min_per_batch: int = 1,
-    ):
-        self.batch_size     = batch_size
-        self.min_per_batch  = min_per_batch
-        self.minority_class = minority_class
+    def __init__(self, dataset, batch_size, class_weights,
+                 minority_class="taping", min_per_batch=1):
+        self.batch_size    = batch_size
+        self.min_per_batch = min_per_batch
 
         labels = [dataset.df.iloc[i]["type"] for i in range(len(dataset))]
         self.minority_idx = [i for i, l in enumerate(labels) if l == minority_class]
         self.majority_idx = [i for i, l in enumerate(labels) if l != minority_class]
 
-        # Weighted probabilities for majority draws
         maj_weights = torch.tensor(
             [class_weights.get(labels[i], 1.0) for i in self.majority_idx],
             dtype=torch.float,
@@ -308,21 +291,16 @@ class MinClassBatchSampler(torch.utils.data.Sampler):
 
     def __iter__(self):
         for _ in range(self.n_batches):
-            # Guaranteed minority slots
-            minority_sample = np.random.choice(
-                self.minority_idx,
-                size=self.min_per_batch,
-                replace=True,
+            minority = np.random.choice(
+                self.minority_idx, size=self.min_per_batch, replace=True
             ).tolist()
-            # Fill remainder from majority (weighted)
-            n_maj = self.batch_size - self.min_per_batch
-            majority_sample = np.random.choice(
+            majority = np.random.choice(
                 self.majority_idx,
-                size=n_maj,
+                size=self.batch_size - self.min_per_batch,
                 replace=True,
                 p=self.maj_probs,
             ).tolist()
-            batch = minority_sample + majority_sample
+            batch = minority + majority
             np.random.shuffle(batch)
             yield batch
 
@@ -340,25 +318,15 @@ def build_dataloaders(
     image_size=768,
     num_workers=4,
     class_weights=None,
-    prompt_dropout_prob=0.10,
-    prompt_noise_prob=0.15,
     synthetic_crack_prob=0.20,
     active_classes=None,
-    guarantee_taping: bool = True,
+    guarantee_taping=True,
 ):
-    """
-    Returns (train_loader, val_loader, train_dataset).
-
-    guarantee_taping=True uses MinClassBatchSampler so every batch
-    contains at least 1 taping sample — prevents silent taping regression.
-    """
     if class_weights is None:
         class_weights = {"crack": 1.0, "taping": 5.4}
 
     train_ds = DrywallDataset(
         metadata_csv, split="train", image_size=image_size, augment=True,
-        prompt_dropout_prob=prompt_dropout_prob,
-        prompt_noise_prob=prompt_noise_prob,
         synthetic_crack_prob=synthetic_crack_prob,
         active_classes=active_classes,
     )
@@ -377,7 +345,8 @@ def build_dataloaders(
         )
     else:
         weights = torch.tensor(
-            [class_weights.get(train_ds.df.iloc[i]["type"], 1.0) for i in range(len(train_ds))],
+            [class_weights.get(train_ds.df.iloc[i]["type"], 1.0)
+             for i in range(len(train_ds))],
             dtype=torch.float,
         )
         sampler = WeightedRandomSampler(weights, len(train_ds), replacement=True)
