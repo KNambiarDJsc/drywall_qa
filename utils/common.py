@@ -60,4 +60,10 @@ def get_device() -> torch.device:
 
 
 def dtype_from_str(s: str) -> torch.dtype:
-    return {"bfloat16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[s]
+    mapping = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32
+    }
+    return mapping[s]
