@@ -58,12 +58,9 @@ wandb/
 # 🔹 Dataset & generated data
 # ================================
 data/
-dataset/
 *.csv
 *.json
 
-# (optional: keep metadata if needed)
-!dataset/metadata.csv
 
 # ================================
 # 🔹 Images & outputs
