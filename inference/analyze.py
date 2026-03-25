@@ -1,3 +1,8 @@
+"""inference/analyze.py
+Phase 12 — Visual grid: [Image | GT | Pred]
+Phase 13 — Failure analysis: thin cracks, shadows, low contrast
+"""
+
 from __future__ import annotations
 import argparse
 import json
@@ -18,7 +23,7 @@ sys.path.append(str(Path(__file__).parents[1]))
 from utils.common import get_logger, ensure_dir, set_seed
 from utils.metrics import dice_score
 from utils.visualize import plot_triplet, plot_grid, plot_training_curves
-from inference.predict import predict_single, DEFAULT_ENSEMBLE
+from inference.predict import predict_single
 
 logger = get_logger("analyze")
 
@@ -34,7 +39,7 @@ def collect_samples(
     n_per_class: int = 6,
     image_size: int = 768,
     threshold: float = 0.5,
-    ensemble_prompts: Optional[dict] = None,
+    cfg: Optional[dict] = None,
 ) -> list[dict]:
     df = pd.read_csv(metadata_csv)
     df = df[df["split"] == split].reset_index(drop=True)
@@ -55,9 +60,10 @@ def collect_samples(
             if gt is None:
                 continue
 
-            e_prompts = (ensemble_prompts or DEFAULT_ENSEMBLE).get(label)
             pred_mask, _ = predict_single(
-                model, row["image_path"], label, e_prompts, threshold, image_size
+                model, row["image_path"], label,
+                inference_cfg=cfg or {},
+                threshold=threshold,
             )
 
             # Compute Dice
@@ -100,7 +106,6 @@ def generate_visuals(
     viz_dir = ensure_dir(viz_dir)
     image_size = cfg["data"]["image_size"] if cfg else 768
     threshold = cfg["training"]["mask_threshold"] if cfg else 0.5
-    ensemble = cfg.get("inference_prompts") if cfg else None
 
     logger.info("Collecting samples for visualisation …")
     samples = collect_samples(
@@ -110,7 +115,7 @@ def generate_visuals(
         n_per_class=n_per_class,
         image_size=image_size,
         threshold=threshold,
-        ensemble_prompts=ensemble,
+        cfg=cfg,
     )
 
     if not samples:
@@ -153,15 +158,15 @@ def analyze_failures(
     df = pd.read_csv(metadata_csv)
     df = df[df["split"] == split].reset_index(drop=True)
     image_size = cfg["data"]["image_size"] if cfg else 768
-    ensemble = cfg.get("inference_prompts") if cfg else None
 
     failures = {"thin_crack": [], "low_contrast": [], "shadow_noise": [], "other": []}
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Failure analysis"):
         label = row["type"]
-        e_prompts = (ensemble or DEFAULT_ENSEMBLE).get(label)
         pred_mask, _ = predict_single(
-            model, row["image_path"], label, e_prompts, threshold, image_size
+            model, row["image_path"], label,
+            inference_cfg=cfg or {},
+            threshold=threshold,
         )
         gt = cv2.imread(str(row["mask_path"]), cv2.IMREAD_GRAYSCALE)
         if gt is None:
