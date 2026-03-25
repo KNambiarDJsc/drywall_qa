@@ -58,8 +58,6 @@ wandb/
 # 🔹 Dataset & generated data
 # ================================
 data/
-*.csv
-*.json
 
 
 # ================================
@@ -107,7 +105,3 @@ torch_compile_debug/
 # ================================
 *.swp
 *.swo
-
-data/
-*.csv
-*.json
