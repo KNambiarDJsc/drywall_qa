@@ -1,136 +1,168 @@
 """preprocessing/coco_to_masks.py
 
-Builds a unified train/val dataset from two Roboflow COCO exports.
+Annotation-agnostic COCO → binary mask converter.
 
-Dataset specs:
-  Drywall (taping): train=821, val=203  — Roboflow pre-split, use as-is
-  Cracks          : train-only 5370     — 80/20 split ourselves (seed=42)
+Priority order per annotation:
+  1. Polygon segmentation  → rasterise with pycocotools
+  2. RLE segmentation      → decode with pycocotools
+  3. Bounding box fallback → filled rectangle (weak supervision)
+  4. Nothing               → skip image
 
-Final counts:
-  train : 4296 cracks + 821  taping = ~5117
-  val   : 1074 cracks + 203  taping = ~1277
+No category filtering. All annotations for an image are merged.
 
-Output layout:
+Dataset layout handled:
+  Taping : train/_annotations.coco.json + valid/_annotations.coco.json
+  Cracks : train/_annotations.coco.json only → 80/20 random split (seed=42)
+
+Output:
   dataset/
-    images/train/    images/val/
-    masks/train/     masks/val/
-    metadata.csv     (image_path, mask_path, type, split)
+    images/train/   images/val/
+    masks/train/    masks/val/
+    metadata.csv    (image_path, mask_path, type, split)
 
-Mask filename: {original_stem}__segment_{label}.png
-File naming:   original filenames kept as-is, never renamed.
+Mask filename : {original_stem}__segment_{label}.png
+Mask values   : {0, 255}, single-channel PNG
+Image names   : never renamed
 """
 
 from __future__ import annotations
+import os
 import json
+import random
 import shutil
 import argparse
-import random
 import numpy as np
-import pandas as pd
+import cv2
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 from pycocotools.coco import COCO
 from pycocotools import mask as coco_mask_utils
-
-import sys
-sys.path.append(str(Path(__file__).parents[1]))
-from utils.common import set_seed, get_logger, ensure_dir
-
-logger = get_logger("preprocess")
+import pandas as pd
 
 
 # ─────────────────────────────────────────────────────────────
-# COCO polygon → binary mask PNG
+# Helpers
 # ─────────────────────────────────────────────────────────────
 
-def convert_coco_split(
-    coco_json: Path,
-    images_dir: Path,
-    out_images_dir: Path,
-    out_masks_dir: Path,
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def ensure_dir(path) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def save_mask(mask: np.ndarray, path: Path) -> None:
+    """Save {0,1} mask as {0,255} single-channel PNG."""
+    out = (mask > 0).astype(np.uint8) * 255
+    cv2.imwrite(str(path), out)
+
+
+# ─────────────────────────────────────────────────────────────
+# Core converter — one COCO split
+# ─────────────────────────────────────────────────────────────
+
+def convert_split(
+    ann_file: Path,
+    image_dir: Path,
+    out_image_dir: Path,
+    out_mask_dir: Path,
     label: str,
 ) -> list[dict]:
     """
-    Convert one COCO annotation file to binary PNG masks.
-
-    Rules:
-      - Polygon segmentation → rasterised with pycocotools (no bounding boxes)
-      - All annotations for one image merged into a single mask (max)
-      - Mask values: {0, 255}, single-channel PNG
-      - Mask filename: {stem}__segment_{label}.png
-      - Images copied to out_images_dir with ORIGINAL filename (no rename)
-      - Images with zero annotations are skipped
-
-    Returns list of dicts: {image_path, mask_path, type}
+    Convert one COCO annotation file → binary masks.
+    Returns list of raw records {image_path, mask_path, type}.
     """
-    ensure_dir(out_images_dir)
-    ensure_dir(out_masks_dir)
-
-    if not coco_json.exists():
-        logger.warning(f"Annotation file not found: {coco_json}")
+    if not ann_file.exists():
+        print(f"  [WARN] Missing annotation file: {ann_file}")
         return []
 
-    coco = COCO(str(coco_json))
-    img_ids = coco.getImgIds()
-    records = []
-    skipped_missing = 0
-    skipped_no_ann  = 0
+    ensure_dir(out_image_dir)
+    ensure_dir(out_mask_dir)
 
-    for img_id in tqdm(img_ids, desc=f"  [{label}] {coco_json.parent.name}", leave=False):
+    coco = COCO(str(ann_file))
+    img_ids = coco.getImgIds()
+
+    records = []
+    n_seg = 0          # used polygon/RLE
+    n_bbox = 0         # fell back to bbox
+    n_missing = 0      # image file not found on disk
+    n_no_ann = 0       # image had annotations but none usable
+
+    for img_id in tqdm(img_ids, desc=f"  [{label}] {ann_file.parent.name}", leave=False):
         img_info  = coco.loadImgs(img_id)[0]
         file_name = img_info["file_name"]
         h, w      = img_info["height"], img_info["width"]
 
-        # Locate source image — Roboflow puts images directly in split dir
-        src_img = images_dir / file_name
-        if not src_img.exists():
-            # Sometimes nested in images/
-            src_img = images_dir / "images" / file_name
-        if not src_img.exists():
-            skipped_missing += 1
+        # ── Locate source image ────────────────────────────────
+        src = image_dir / file_name
+        if not src.exists():
+            src = image_dir / "images" / file_name   # nested fallback
+        if not src.exists():
+            n_missing += 1
             continue
 
-        # Collect annotations
+        # ── Build combined mask from all annotations ───────────
+        combined = np.zeros((h, w), dtype=np.uint8)
+        has_ann  = False
+
         ann_ids = coco.getAnnIds(imgIds=img_id)
         anns    = coco.loadAnns(ann_ids)
 
-        combined_mask = np.zeros((h, w), dtype=np.uint8)
-        has_seg = False
-
         for ann in anns:
-            seg = ann.get("segmentation")
-            if not seg:
-                continue
-            has_seg = True
+            seg  = ann.get("segmentation")
+            bbox = ann.get("bbox")
 
-            if isinstance(seg, list):
-                # Polygon list → RLE → decode
-                rles = coco_mask_utils.frPyObjects(seg, h, w)
-                m    = coco_mask_utils.decode(rles)            # H×W or H×W×N
-                if m.ndim == 3:
-                    m = m.max(axis=2)
-                combined_mask = np.maximum(combined_mask, m.astype(np.uint8))
+            # CASE 1: polygon segmentation
+            if seg and len(seg) > 0:
+                try:
+                    if isinstance(seg, list):
+                        rles = coco_mask_utils.frPyObjects(seg, h, w)
+                        m    = coco_mask_utils.decode(rles)
+                        if m.ndim == 3:
+                            m = m.max(axis=2)
+                        combined = np.maximum(combined, m.astype(np.uint8))
+                        has_ann  = True
+                        n_seg   += 1
 
-            elif isinstance(seg, dict):
-                # Already RLE
-                m = coco_mask_utils.decode(seg)
-                combined_mask = np.maximum(combined_mask, m.astype(np.uint8))
+                    elif isinstance(seg, dict):
+                        m       = coco_mask_utils.decode(seg)
+                        combined = np.maximum(combined, m.astype(np.uint8))
+                        has_ann  = True
+                        n_seg   += 1
 
-        if not has_seg:
-            skipped_no_ann += 1
+                except Exception:
+                    # malformed segmentation → fall through to bbox
+                    pass
+
+            # CASE 2: bbox fallback (cracks dataset)
+            if not has_ann and bbox:
+                x, y, bw, bh = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                x2 = min(x + bw, w)
+                y2 = min(y + bh, h)
+                if x2 > x and y2 > y:
+                    combined[y:y2, x:x2] = 1
+                    has_ann  = True
+                    n_bbox  += 1
+
+        if not has_ann:
+            n_no_ann += 1
             continue
 
-        # Save mask: {0, 255}
+        # ── Save mask ──────────────────────────────────────────
         stem      = Path(file_name).stem
         mask_name = f"{stem}__segment_{label}.png"
-        mask_path = out_masks_dir / mask_name
-        Image.fromarray(combined_mask * 255, mode="L").save(mask_path)
+        mask_path = out_mask_dir / mask_name
+        save_mask(combined, mask_path)
 
-        # Copy image keeping original filename
-        dst_img = out_images_dir / file_name
+        # ── Copy image (original filename, never renamed) ──────
+        dst_img = out_image_dir / file_name
         if not dst_img.exists():
-            shutil.copy2(src_img, dst_img)
+            shutil.copy2(src, dst_img)
 
         records.append({
             "image_path": str(dst_img),
@@ -138,20 +170,16 @@ def convert_coco_split(
             "type":       label,
         })
 
-    logger.info(
-        f"  [{label}] converted={len(records)}  "
-        f"skipped_missing={skipped_missing}  skipped_no_ann={skipped_no_ann}"
-    )
+    print(f"  [{label}] {ann_file.parent.name}: "
+          f"converted={len(records)}  "
+          f"seg={n_seg}  bbox_fallback={n_bbox}  "
+          f"missing={n_missing}  no_ann={n_no_ann}")
+
     return records
 
 
-def _images_dir(split_dir: Path) -> Path:
-    """Roboflow puts images directly in the split folder."""
-    return split_dir
-
-
 # ─────────────────────────────────────────────────────────────
-# Main builder
+# Dataset builder
 # ─────────────────────────────────────────────────────────────
 
 def build_dataset(
@@ -161,75 +189,57 @@ def build_dataset(
     val_split:   float = 0.20,
     seed:        int   = 42,
 ) -> None:
-    """
-    Assembles the unified dataset according to spec.
-
-    Taping  → use Roboflow train/valid split exactly
-    Cracks  → convert train/ entirely, then 80/20 random split (seed=42)
-    """
     set_seed(seed)
-
-    # ── Intermediate staging dirs ─────────────────────────────
     staging = out_root / "_staging"
 
-    # ═══════════════════════════════════════════════════════════
-    # 1. TAPING — respect Roboflow split
-    # ═══════════════════════════════════════════════════════════
-    logger.info("\n── Taping dataset ──────────────────────────────────────")
-
-    taping_train = convert_coco_split(
-        coco_json      = taping_root / "train" / "_annotations.coco.json",
-        images_dir     = _images_dir(taping_root / "train"),
-        out_images_dir = staging / "taping" / "train" / "images",
-        out_masks_dir  = staging / "taping" / "train" / "masks",
-        label          = "taping",
+    # ── 1. Taping — Roboflow pre-split ────────────────────────
+    print("\n── Taping dataset ──────────────────────────────────────")
+    taping_train = convert_split(
+        ann_file      = taping_root / "train" / "_annotations.coco.json",
+        image_dir     = taping_root / "train",
+        out_image_dir = staging / "taping" / "train" / "images",
+        out_mask_dir  = staging / "taping" / "train" / "masks",
+        label         = "taping",
     )
-    taping_val = convert_coco_split(
-        coco_json      = taping_root / "valid" / "_annotations.coco.json",
-        images_dir     = _images_dir(taping_root / "valid"),
-        out_images_dir = staging / "taping" / "val" / "images",
-        out_masks_dir  = staging / "taping" / "val" / "masks",
-        label          = "taping",
+    taping_val = convert_split(
+        ann_file      = taping_root / "valid" / "_annotations.coco.json",
+        image_dir     = taping_root / "valid",
+        out_image_dir = staging / "taping" / "val" / "images",
+        out_mask_dir  = staging / "taping" / "val" / "masks",
+        label         = "taping",
     )
 
     if not taping_train:
-        raise ValueError(f"No taping train images — check {taping_root}/train/")
+        raise ValueError(f"Zero taping train images. Check {taping_root}/train/")
     if not taping_val:
-        raise ValueError(f"No taping val images — check {taping_root}/valid/")
+        raise ValueError(f"Zero taping val images. Check {taping_root}/valid/")
 
-    logger.info(f"  Taping  train={len(taping_train)}  val={len(taping_val)}")
-
-    # ═══════════════════════════════════════════════════════════
-    # 2. CRACKS — convert all, then 80/20 random split
-    # ═══════════════════════════════════════════════════════════
-    logger.info("\n── Cracks dataset ──────────────────────────────────────")
-
-    crack_all = convert_coco_split(
-        coco_json      = crack_root / "train" / "_annotations.coco.json",
-        images_dir     = _images_dir(crack_root / "train"),
-        out_images_dir = staging / "crack" / "all" / "images",
-        out_masks_dir  = staging / "crack" / "all" / "masks",
-        label          = "crack",
+    # ── 2. Cracks — train only, split ourselves ───────────────
+    print("\n── Cracks dataset ──────────────────────────────────────")
+    crack_all = convert_split(
+        ann_file      = crack_root / "train" / "_annotations.coco.json",
+        image_dir     = crack_root / "train",
+        out_image_dir = staging / "crack" / "all" / "images",
+        out_mask_dir  = staging / "crack" / "all" / "masks",
+        label         = "crack",
     )
 
     if not crack_all:
-        raise ValueError(f"No crack images — check {crack_root}/train/")
+        raise ValueError(f"Zero crack images. Check {crack_root}/train/")
 
     # 80/20 random split, seed=42, no stratification
-    random.seed(seed)
-    indices   = list(range(len(crack_all)))
+    indices = list(range(len(crack_all)))
     random.shuffle(indices)
-    n_val     = round(len(crack_all) * val_split)
-    val_idx   = set(indices[:n_val])
-    crack_train = [crack_all[i] for i in range(len(crack_all)) if i not in val_idx]
-    crack_val   = [crack_all[i] for i in val_idx]
+    n_val       = round(len(crack_all) * val_split)
+    val_set     = set(indices[:n_val])
+    crack_train = [crack_all[i] for i in range(len(crack_all)) if i not in val_set]
+    crack_val   = [crack_all[i] for i in val_set]
 
-    logger.info(f"  Cracks  total={len(crack_all)}  train={len(crack_train)}  val={len(crack_val)}")
+    print(f"  [crack] total={len(crack_all)}  "
+          f"train={len(crack_train)}  val={len(crack_val)}")
 
-    # ═══════════════════════════════════════════════════════════
-    # 3. MERGE + copy into final directory layout
-    # ═══════════════════════════════════════════════════════════
-    logger.info("\n── Building final dataset layout ───────────────────────")
+    # ── 3. Merge + copy into final layout ─────────────────────
+    print("\n── Building final layout ───────────────────────────────")
 
     splits = {
         "train": taping_train + crack_train,
@@ -241,35 +251,25 @@ def build_dataset(
     for split_tag, records in splits.items():
         img_out  = ensure_dir(out_root / "images" / split_tag)
         mask_out = ensure_dir(out_root / "masks"  / split_tag)
-
-        seen_images = set()
-        seen_masks  = set()
+        seen     = set()
 
         for row in tqdm(records, desc=f"  Copying {split_tag:5s}", leave=False):
             src_img  = Path(row["image_path"])
             src_mask = Path(row["mask_path"])
+            key      = src_img.name
+
+            if key in seen:
+                print(f"  [WARN] Duplicate skipped: {key}")
+                continue
+            seen.add(key)
 
             dst_img  = img_out  / src_img.name
             dst_mask = mask_out / src_mask.name
-
-            # Guard: no duplicates, no cross-split contamination
-            if dst_img.name in seen_images:
-                logger.warning(f"  Duplicate image skipped: {dst_img.name}")
-                continue
-            if dst_mask.name in seen_masks:
-                logger.warning(f"  Duplicate mask skipped: {dst_mask.name}")
-                continue
-
-            seen_images.add(dst_img.name)
-            seen_masks.add(dst_mask.name)
 
             if not dst_img.exists():
                 shutil.copy2(src_img, dst_img)
             if not dst_mask.exists():
                 shutil.copy2(src_mask, dst_mask)
-
-            # Sanity: mask file must exist after copy
-            assert dst_mask.exists(), f"Mask copy failed: {dst_mask}"
 
             all_rows.append({
                 "image_path": str(dst_img),
@@ -278,56 +278,36 @@ def build_dataset(
                 "split":      split_tag,
             })
 
-    # ═══════════════════════════════════════════════════════════
-    # 4. Write metadata.csv
-    # ═══════════════════════════════════════════════════════════
+    # ── 4. Write metadata.csv ─────────────────────────────────
     meta = pd.DataFrame(all_rows, columns=["image_path", "mask_path", "type", "split"])
     meta.to_csv(out_root / "metadata.csv", index=False)
+    for tag in ("train", "val"):
+        meta[meta["split"] == tag].to_csv(out_root / f"metadata_{tag}.csv", index=False)
 
-    # Also write per-split files for convenience
-    for split_tag in ("train", "val"):
-        meta[meta["split"] == split_tag].to_csv(
-            out_root / f"metadata_{split_tag}.csv", index=False
-        )
+    # ── 5. Validation report ──────────────────────────────────
+    print("\n── Final dataset summary ───────────────────────────────")
+    for tag in ("train", "val"):
+        sub = meta[meta["split"] == tag]
+        c   = sub["type"].value_counts().to_dict()
+        print(f"  [{tag:5s}]  total={len(sub):5d}  "
+              f"crack={c.get('crack',0):5d}  taping={c.get('taping',0):4d}")
 
-    # ═══════════════════════════════════════════════════════════
-    # 5. Validation report
-    # ═══════════════════════════════════════════════════════════
-    logger.info("\n── Dataset summary ─────────────────────────────────────")
-    for split_tag in ("train", "val"):
-        sub    = meta[meta["split"] == split_tag]
-        counts = sub["type"].value_counts().to_dict()
-        logger.info(
-            f"  [{split_tag:5s}]  total={len(sub):5d}  "
-            f"crack={counts.get('crack', 0):5d}  taping={counts.get('taping', 0):4d}"
-        )
+    # Alignment: every mask file must exist
+    missing = [r for _, r in meta.iterrows() if not Path(r["mask_path"]).exists()]
+    # Cross-split: no filename in both splits
+    train_names = set(meta[meta["split"]=="train"]["image_path"].apply(lambda p: Path(p).name))
+    val_names   = set(meta[meta["split"]=="val"  ]["image_path"].apply(lambda p: Path(p).name))
+    overlap     = train_names & val_names
 
-    total_train = len(meta[meta["split"] == "train"])
-    total_val   = len(meta[meta["split"] == "val"])
+    print(f"\n  Expected  train=~5117  val=~1277")
+    print(f"  Alignment:   {'✅ PASSED' if not missing  else f'❌ {len(missing)} missing masks'}")
+    print(f"  No leakage:  {'✅ PASSED' if not overlap  else f'❌ {len(overlap)} files in both splits'}")
+    print(f"\n✅ metadata.csv → {out_root / 'metadata.csv'}")
 
-    # Alignment check: every image must have a corresponding mask file
-    missing = 0
-    for _, row in meta.iterrows():
-        if not Path(row["mask_path"]).exists():
-            logger.error(f"  MISSING mask: {row['mask_path']}")
-            missing += 1
-    if missing:
-        raise RuntimeError(f"{missing} masks are missing — check conversion step")
+    if missing or overlap:
+        raise RuntimeError("Dataset validation failed — see above.")
 
-    # Cross-split check: no filename appears in both train and val
-    train_imgs = set(meta[meta["split"]=="train"]["image_path"].apply(lambda p: Path(p).name))
-    val_imgs   = set(meta[meta["split"]=="val"  ]["image_path"].apply(lambda p: Path(p).name))
-    overlap    = train_imgs & val_imgs
-    if overlap:
-        raise RuntimeError(f"Train/val overlap detected: {len(overlap)} files in both splits!")
-
-    logger.info(f"\n  Expected  train=~5117  val=~1277")
-    logger.info(f"  Got       train={total_train}    val={total_val}")
-    logger.info(f"  Alignment check: {'✅ PASSED' if missing == 0 else '❌ FAILED'}")
-    logger.info(f"  Cross-split check: {'✅ PASSED' if not overlap else '❌ FAILED'}")
-    logger.info(f"\n✅ metadata.csv → {out_root / 'metadata.csv'}")
-
-    # Optionally clean up staging
+    # Clean staging
     shutil.rmtree(staging, ignore_errors=True)
 
 
@@ -337,8 +317,8 @@ def build_dataset(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="COCO → unified binary-mask dataset")
-    parser.add_argument("--crack_root",  required=True, help="Path to cracks Roboflow export")
-    parser.add_argument("--taping_root", required=True, help="Path to taping Roboflow export")
+    parser.add_argument("--crack_root",  required=True)
+    parser.add_argument("--taping_root", required=True)
     parser.add_argument("--out_root",    default="dataset")
     parser.add_argument("--val_split",   type=float, default=0.20)
     parser.add_argument("--seed",        type=int,   default=42)
