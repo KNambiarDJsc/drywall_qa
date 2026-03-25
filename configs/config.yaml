@@ -1,5 +1,6 @@
 # ============================================================
-# Drywall QA — SAM ViT-H + DoRA config
+# Drywall QA — Grounded SAM 2 + DoRA
+# Text-conditioned segmentation: DINO (frozen) → bbox → SAM 2 (fine-tuned)
 # ============================================================
 
 seed: 42
@@ -11,18 +12,44 @@ data:
   val_split: 0.20
   image_size: 768
 
-# ── Model ────────────────────────────────────────────────────
+# ── Text prompts (used by Grounding DINO) ────────────────────
+prompts:
+  crack:
+    - "crack"
+    - "wall crack"
+    - "surface crack"
+    - "hairline crack"
+  taping:
+    - "taping area"
+    - "drywall seam"
+    - "joint tape"
+    - "wall joint"
+
+# Inference: single best prompt per class
+inference_prompts:
+  crack: "crack"
+  taping: "drywall seam"
+
+# ── Models ───────────────────────────────────────────────────
 model:
-  name: "facebook/sam-vit-huge"
-  precision: "fp16"          # RTX 4090 — fp16 faster than bfloat16 on Ada Lovelace
+  grounding_dino: "IDEA-Research/grounding-dino-tiny"   # frozen
+  sam2: "facebook/sam2-hiera-large"                      # fine-tuned with DoRA
+  precision: "fp16"          # RTX 4090
   torch_compile: false
 
-# ── DoRA ─────────────────────────────────────────────────────
+# ── DoRA (applied to SAM 2 only) ─────────────────────────────
 dora:
   r: 16
   lora_alpha: 32
   lora_dropout: 0.05
   use_dora: true
+
+# ── Grounding DINO settings ───────────────────────────────────
+dino:
+  box_threshold: 0.25
+  text_threshold: 0.25
+  # If DINO finds no box, fall back to full-image box
+  fallback_full_image: true
 
 # ── Training ─────────────────────────────────────────────────
 training:
@@ -50,13 +77,12 @@ training:
       freeze_encoder: false
       hem_start_epoch: 0
 
-  batch_size: 4              # RTX 4090 24GB — SAM ViT-H at 768px fits bs=4
+  batch_size: 4
   grad_accumulation: 2       # effective batch = 8
   mask_threshold: 0.5
-  top_k_masks: 3
   optimizer: "adamw"
   weight_decay: 1.0e-4
-  num_workers: 8             # RTX 4090 workstation — 8 workers saturates the GPU
+  num_workers: 8
 
 # ── Loss ─────────────────────────────────────────────────────
 loss:
@@ -84,9 +110,8 @@ hem:
   enabled: true
   dice_threshold: 0.45
   boost_factor: 3.0
-  update_every_n_epochs: 1
 
-# ── Sampling weights ─────────────────────────────────────────
+# ── Class weights ─────────────────────────────────────────────
 class_weights:
   crack: 1.0
   taping: 5.4
@@ -103,4 +128,3 @@ output:
   checkpoint_dir: "checkpoints"
   mask_dir: "outputs/masks"
   viz_dir: "outputs/visualizations"
-  best_metric: "dice"
