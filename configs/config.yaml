@@ -1,6 +1,5 @@
 # ============================================================
 # Drywall QA — Grounded SAM 2 + DoRA
-# Text-conditioned segmentation: DINO (frozen) → bbox → SAM 2 (fine-tuned)
 # ============================================================
 
 seed: 42
@@ -12,7 +11,6 @@ data:
   val_split: 0.20
   image_size: 768
 
-# ── Text prompts (used by Grounding DINO) ────────────────────
 prompts:
   crack:
     - "crack"
@@ -25,31 +23,29 @@ prompts:
     - "joint tape"
     - "wall joint"
 
-# Inference: single best prompt per class
 inference_prompts:
   crack: "crack"
   taping: "drywall seam"
 
 # ── Models ───────────────────────────────────────────────────
 model:
-  grounding_dino: "IDEA-Research/grounding-dino-tiny"   # frozen
-  sam2: "facebook/sam2-hiera-large"                      # fine-tuned with DoRA
-  precision: "bf16"          # RTX 4090 Ada — bf16 more stable than fp16 for transformers
-  gradient_checkpointing: true   # mandatory for Phase 3 on 24GB VRAM
+  grounding_dino: "IDEA-Research/grounding-dino-tiny"
+  sam2: "facebook/sam2-hiera-large"
+  precision: "bfloat16"   # ✅ FIXED
+  gradient_checkpointing: true
   torch_compile: false
 
-# ── DoRA (applied to SAM 2 only) ─────────────────────────────
+# ── DoRA ─────────────────────────────────────────────────────
 dora:
   r: 16
   lora_alpha: 32
   lora_dropout: 0.05
   use_dora: true
 
-# ── Grounding DINO settings ───────────────────────────────────
+# ── Grounding DINO ───────────────────────────────────────────
 dino:
   box_threshold: 0.25
   text_threshold: 0.25
-  # If DINO finds no box, fall back to full-image box
   fallback_full_image: true
 
 # ── Training ─────────────────────────────────────────────────
@@ -78,19 +74,19 @@ training:
       freeze_encoder: false
       hem_start_epoch: 0
 
-  batch_size: 2              # 4090 24GB — drop to 2 for Phase 3 safety
-  grad_accumulation: 4       # effective batch = 8 (same as before)
+  batch_size: 2
+  grad_accumulation: 4
   mask_threshold: 0.5
   optimizer: "adamw"
   weight_decay: 1.0e-4
-  num_workers: 4             # 8 can cause CPU/RAM pressure on 24GB systems
+  num_workers: 4
 
 # ── Loss ─────────────────────────────────────────────────────
 loss:
   focal_weight: 0.35
   tversky_weight: 0.50
-  boundary_weight: 0.15      # increased from 0.10 — snaps to crack edges vs filling bbox
-  tversky_alpha: 0.8         # increased from 0.7 — harder FN penalty for weak-supervision cracks
+  boundary_weight: 0.15
+  tversky_alpha: 0.8
   tversky_beta: 0.2
   focal_alpha: 0.50
   focal_gamma: 2.0
